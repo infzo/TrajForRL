@@ -75,19 +75,19 @@ flowchart LR
     subgraph 输入
         SID[session_id: str]
         TOK[tokenizer]
-        ANS[answer: Optional[str]]
+        ANS["answer: Optional(str)"]
     end
 
     subgraph 内部依赖
-        TP[TrajProxy<br/>RequestRepository]
+        TP["TrajProxy<br/>RequestRepository"]
         TC[trajectory_construct_cls]
         RC[reward_compute_cls]
     end
 
     subgraph 处理
-        GET[1. 从 TrajProxy 获取 records]
-        AGG[2. 聚合 records + Tokenize]
-        RWD[3. 计算奖励]
+        GET["1. 从 TrajProxy 获取 records"]
+        AGG["2. 聚合 records + Tokenize"]
+        RWD["3. 计算奖励"]
     end
 
     subgraph 输出
@@ -363,19 +363,19 @@ def default_reward_compute_cls(
 ```mermaid
 flowchart LR
     subgraph 输入
-        TRJS[trajectories: List[Trajectory>]
+        TRJS["trajectories: List(Trajectory)"]
     end
 
     subgraph 处理
-        PAD[1. Padding 对齐<br/>左填充 prompts，右填充 responses]
-        ATM[2. 构建 attention_mask]
-        POS[3. 计算 position_ids]
-        RWD[4. 构建 reward tensors]
-        ASM[5. 组装 DataProto]
+        PAD["1. Padding 对齐<br/>左填充 prompts，右填充 responses"]
+        ATM["2. 构建 attention_mask"]
+        POS["3. 计算 position_ids"]
+        RWD["4. 构建 reward tensors"]
+        ASM["5. 组装 DataProto"]
     end
 
     subgraph 输出
-        DP[DataProto<br/>固定在 CPU]
+        DP["DataProto<br/>固定在 CPU"]
     end
 
     TRJS --> PAD
