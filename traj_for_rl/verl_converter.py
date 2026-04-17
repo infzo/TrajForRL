@@ -87,8 +87,17 @@ class VerlConverter:
         # 4. position_ids (cumsum of attention_mask)
         position_ids = self._build_position_ids(attention_mask)
 
-        # 5. response_mask (有效 response token)
-        response_mask = (responses_batch != self.pad_token_id).long()
+        # 5. response_mask (标记哪些 token 参与 loss 计算)
+        # 优先使用 step_masks（多轮对话中区分历史和生成 token）
+        # 如果 step_masks 不存在，使用简单的 padding mask
+        if all(t.step_masks is not None for t in trajectories):
+            response_mask = self._pad_right(
+                [t.step_masks for t in trajectories],
+                self.max_response_length, 0  # padding 值为 0
+            )
+        else:
+            # fallback: 所有有效 token 都参与 loss
+            response_mask = (responses_batch != self.pad_token_id).long()
 
         # 6. rewards (放在 response 最后一个有效 token 位置)
         token_level_rewards = self._build_rewards(

@@ -10,11 +10,13 @@
 3. 格式兼容：输出严格匹配 verl DataProto 格式
 4. 职责分离：Tokenize 逻辑由 trajectory_construct_cls 负责，本模块不绑定特定 tokenizer
 5. 异步优先：核心接口采用 async/await，适配上层异步训练框架
+6. **多轮对话支持**：正确构建 response_mask，区分历史 token 和生成 token
 
 **首版范围：**
 - 支持纯文本轨迹处理
 - 支持轨迹级奖励（traj_reward → token_level_rewards）
 - 预留 token_level_scores 字段供后续扩展
+- **支持多轮对话拼接**：正确构建 step_masks 区分参与 loss 计算的 token
 
 ---
 
@@ -148,8 +150,10 @@ class Trajectory:
     
     Attributes:
         trajectory_id: 轨迹唯一标识（通常等于 session_id）
-        prompt_ids: Prompt 部分的 token IDs
-        response_ids: Response 部分的 token IDs
+        prompt_ids: Prompt 部分的 token IDs（第一轮对话的初始 prompt）
+        response_ids: Response 部分的 token IDs（包含所有轮次的 completion + 增量 prompt）
+        step_masks: 标记哪些 response token 参与 loss 计算（1=参与，0=不参与）
+                    多轮对话中，只有每轮生成的 completion_ids 参与 loss，历史部分 mask=0
         traj_reward: 轨迹级别奖励（先置空，由 reward_compute_cls 填充）
         step_rewards: 预留字段，Step 级别奖励
         metadata: 元数据（可包含 model、token 统计等）
@@ -157,6 +161,7 @@ class Trajectory:
     trajectory_id: str
     prompt_ids: List[int]
     response_ids: List[int]
+    step_masks: Optional[List[int]] = None  # 标记哪些 token 参与 loss
     traj_reward: Optional[float] = None  # 先置空，后填充
     step_rewards: Optional[List[float]] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
@@ -286,13 +291,17 @@ def default_trajectory_construct_cls(
 ) -> Trajectory:
     """默认轨迹处理器
     
-    策略：取最后一条 record 作为完整轨迹。
-    假设最后一条 record 已经包含完整的对话信息。
-    优先使用已有的 token_ids，如果不存在则使用 tokenizer tokenize。
+    支持多轮对话拼接，正确构建 step_masks。
+    
+    多轮对话处理策略（参考 rllm assemble_steps）：
+    1. prompt_ids = 第一条 record 的 token_ids（初始 prompt）
+    2. response_ids = 所有轮次的 completion_ids + 增量 prompt
+    3. step_masks = 标记哪些 token 参与 loss（只有 completion_ids 参与）
     
     Args:
         session_id: 会话 ID
         records: 多轮对话记录列表
+                 每条 record 的 token_ids 包含完整历史（累积式）
         tokenizer: Tokenizer 对象
         answer: 标准答案（此默认实现不使用）
     
@@ -302,37 +311,82 @@ def default_trajectory_construct_cls(
     if not records:
         raise ValueError(f"No records found for session {session_id}")
 
-    # 取最后一条记录（包含完整对话）
-    last_record = records[-1]
-
-    # 优先使用已有的 token_ids
-    prompt_ids = last_record.get('token_ids')
-    response_ids = last_record.get('response_ids')
+    # 单轮对话：直接使用，所有 response 都参与 loss
+    if len(records) == 1:
+        record = records[0]
+        prompt_ids = record.get('token_ids')
+        response_ids = record.get('response_ids')
+        
+        # 如果没有 token_ids，使用 tokenizer tokenize
+        if prompt_ids is None:
+            prompt_text = record.get('prompt_text', '')
+            prompt_ids = tokenizer.encode(prompt_text, add_special_tokens=False) if prompt_text else []
+        
+        if response_ids is None:
+            response_text = record.get('response_text', '')
+            response_ids = tokenizer.encode(response_text, add_special_tokens=False) if response_text else []
+        
+        # 单轮对话：所有 response 都参与 loss
+        step_masks = [1] * len(response_ids) if response_ids else None
+        
+        return Trajectory(
+            trajectory_id=session_id,
+            prompt_ids=prompt_ids,
+            response_ids=response_ids,
+            step_masks=step_masks,
+            traj_reward=None,
+            metadata={
+                'model': record.get('model'),
+                'prompt_tokens': record.get('prompt_tokens'),
+                'completion_tokens': record.get('completion_tokens'),
+            }
+        )
     
-    # 如果没有 token_ids，使用 tokenizer tokenize
-    if prompt_ids is None:
-        prompt_text = last_record.get('prompt_text', '')
-        if prompt_text:
-            prompt_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
-        else:
-            prompt_ids = []
+    # 多轮对话：拼接所有轮次，构建 step_masks
+    # 初始 prompt 来自第一条 record
+    initial_prompt_ids = records[0].get('token_ids')
+    if initial_prompt_ids is None:
+        initial_prompt_text = records[0].get('prompt_text', '')
+        initial_prompt_ids = tokenizer.encode(initial_prompt_text, add_special_tokens=False) if initial_prompt_text else []
     
-    if response_ids is None:
-        response_text = last_record.get('response_text', '')
-        if response_text:
-            response_ids = tokenizer.encode(response_text, add_special_tokens=False)
+    accumulated_sequence = initial_prompt_ids.copy()
+    response_tokens = []
+    step_masks = []
+    
+    for i, record in enumerate(records):
+        current_prompt_ids = record.get('token_ids')
+        current_response_ids = record.get('response_ids')
+        
+        # 如果没有 token_ids，使用 tokenizer tokenize
+        if current_prompt_ids is None:
+            prompt_text = record.get('prompt_text', '')
+            current_prompt_ids = tokenizer.encode(prompt_text, add_special_tokens=False) if prompt_text else []
+        
+        if current_response_ids is None:
+            response_text = record.get('response_text', '')
+            current_response_ids = tokenizer.encode(response_text, add_special_tokens=False) if response_text else []
+        
+        if i == 0:
+            # 第一轮：completion 参与 loss
+            response_tokens.extend(current_response_ids)
+            step_masks.extend([1] * len(current_response_ids))
+            accumulated_sequence = current_prompt_ids + current_response_ids
         else:
-            response_ids = []
-
+            # 后续轮次：增量 prompt 不参与 loss，completion 参与 loss
+            new_prompt_len = len(current_prompt_ids) - len(accumulated_sequence)
+            response_tokens.extend(current_prompt_ids[len(accumulated_sequence):] + current_response_ids)
+            step_masks.extend([0] * new_prompt_len + [1] * len(current_response_ids))
+            accumulated_sequence = current_prompt_ids + current_response_ids
+    
     return Trajectory(
         trajectory_id=session_id,
-        prompt_ids=prompt_ids,
-        response_ids=response_ids,
-        traj_reward=None,  # 先置空，由 reward_compute_cls 填充
+        prompt_ids=initial_prompt_ids,
+        response_ids=response_tokens,
+        step_masks=step_masks if step_masks else None,
+        traj_reward=None,
         metadata={
-            'model': last_record.get('model'),
-            'prompt_tokens': last_record.get('prompt_tokens'),
-            'completion_tokens': last_record.get('completion_tokens'),
+            'model': records[-1].get('model'),
+            'n_steps': len(records),
         }
     )
 
@@ -512,8 +566,17 @@ class VerlConverter:
         # 4. position_ids (cumsum of attention_mask)
         position_ids = self._build_position_ids(attention_mask)
 
-        # 5. response_mask (有效 response token)
-        response_mask = (responses_batch != self.pad_token_id).long()
+        # 5. response_mask (标记哪些 token 参与 loss 计算)
+        # 优先使用 step_masks（多轮对话中区分历史和生成 token）
+        # 如果 step_masks 不存在，使用简单的 padding mask
+        if all(t.step_masks is not None for t in trajectories):
+            response_mask = self._pad_right(
+                [t.step_masks for t in trajectories],
+                self.max_response_length, 0  # padding 值为 0
+            )
+        else:
+            # fallback: 所有有效 token 都参与 loss
+            response_mask = (responses_batch != self.pad_token_id).long()
 
         # 6. rewards (放在 response 最后一个有效 token 位置)
         token_level_rewards = self._build_rewards(
@@ -769,6 +832,41 @@ TrajForRL/
 
 ---
 
+## 多轮对话处理
+
+### 数据模型
+
+TrajProxy 中每条 Record 的 `token_ids` 包含完整的对话历史（累积式），例如：
+
+```
+Record 0: token_ids = [P0],           response_ids = [C0]
+Record 1: token_ids = [P0, C0, P1],   response_ids = [C1]
+Record 2: token_ids = [P0, C0, P1, C1, P2], response_ids = [C2]
+```
+
+### 拼接策略（参考 rllm assemble_steps）
+
+将多轮对话拼接为一条训练数据：
+
+```
+prompt_ids = [P0]  (第一条 record 的初始 prompt)
+response_ids = [C0] + [P1] + [C1] + [P2] + [C2]
+step_masks  = [1,...,1] + [0,...,0] + [1,...,1] + [0,...,0] + [1,...,1]
+               ^^^ C0      ^^^ 不参与   ^^^ C1      ^^^ 不参与   ^^^ C2
+```
+
+**step_masks 说明：**
+- `1`: 该 token 参与 loss 计算（生成的 completion）
+- `0`: 该 token 不参与 loss 计算（历史对话，已训练过）
+
+### response_mask 构建
+
+在 `VerlConverter.convert()` 中：
+- 如果所有 Trajectory 都有 `step_masks`：使用 `_pad_right()` 对 step_masks 进行 padding
+- 否则：使用简单的 padding mask（所有有效 token 都参与 loss）
+
+---
+
 ## Corner Case 处理
 
 ### 输入边界条件
@@ -778,8 +876,10 @@ TrajForRL/
 | 空 records | `records = []` | 抛出 ValueError | `VAEEHandler.process()` |
 | 空 prompt_ids | `prompt_ids = []` 或 `None` | 抛出 ValueError | `VAEEHandler.process()` |
 | 空 response_ids | `response_ids = []` 或 `None` | 抛出 ValueError | `VAEEHandler.process()` |
-| token_ids 不存在 | `last_record.get('token_ids') = None` | 使用 tokenizer.encode | `default_trajectory_construct_cls` |
+| token_ids 不存在 | `record.get('token_ids') = None` | 使用 tokenizer.encode | `default_trajectory_construct_cls` |
 | traj_reward 为 None | `trajectory.traj_reward = None` | 默认填充 0.0 | 参考 `rllm/experimental/verl/transform.py:224` |
+| 单轮对话 | `len(records) == 1` | step_masks 全为 1 | `default_trajectory_construct_cls` |
+| 多轮对话 | `len(records) > 1` | 拼接并构建 step_masks | `default_trajectory_construct_cls` |
 
 ### 填充和截断
 
@@ -816,7 +916,7 @@ TrajForRL/
 | 多模态支持 | 首版不支持 | 简化范围，后续扩展 |
 | 奖励字段命名 | 使用 verl 原生命名 | token_level_rewards, token_level_scores，直接与 verl 训练流程对接 |
 | 注册机制 | 函数式注册 | 简单直接，无需继承 |
-| 多 Record 处理 | 可配置 | 通过 processor 控制聚合策略 |
+| 多 Record 处理 | 拼接为一条数据 | 参考 rllm assemble_steps，多轮对话拼接为单条训练数据 |
 | Non-Tensor 字段 | 支持 uid, ground_truth, data_source | verl 训练流程必需（GRPO advantage 计算需要 uid） |
 | 奖励来源 | 模块内计算 | 由 reward_compute_cls 实现，返回填充后的 Trajectory |
 | 模块封装 | 仅独立模块 | 上层直接调用，不需要 Facade |
@@ -833,6 +933,9 @@ TrajForRL/
 | 日志框架 | 使用 logging | 使用 Python 标准库 logging |
 | VAEEHandler 类名 | V-AEE Handler | 模块一的核心处理器类名 |
 | VerlConverter 类名 | VerlConverter | 模块二的转换器类名 |
+| **多轮对话拼接** | 参考 rllm assemble_steps | 正确区分历史 token 和生成 token |
+| **step_masks 字段** | 新增 Trajectory.step_masks | 标记哪些 response token 参与 loss 计算 |
+| **response_mask 来源** | 优先使用 step_masks | 如果存在 step_masks 则使用，否则 fallback 到 padding mask |
 
 ---
 
@@ -961,6 +1064,37 @@ def test_converter_truncation():
     assert data_proto.batch['prompts'][0].tolist() == [4, 5, 6, 7, 8]
     # 右截断：取前 5 个
     assert data_proto.batch['responses'][0].tolist() == [9, 10, 11, 12, 13]
+
+def test_multi_turn_response_mask():
+    """测试多轮对话的 response_mask 构建
+    
+    模拟 2 轮对话：
+    Record 0: token_ids=[1,2,3], response_ids=[4,5]
+    Record 1: token_ids=[1,2,3,4,5,6], response_ids=[7,8]
+    
+    预期输出：
+    prompt_ids = [1,2,3]
+    response_ids = [4,5,6,7,8]
+    step_masks = [1,1,0,1,1]  # 只有 completion 参与 loss
+    """
+    records = [
+        {'token_ids': [1, 2, 3], 'response_ids': [4, 5]},
+        {'token_ids': [1, 2, 3, 4, 5, 6], 'response_ids': [7, 8]},
+    ]
+    
+    # 调用 default_trajectory_construct_cls
+    trajectory = default_trajectory_construct_cls('test_multi', records, mock_tokenizer)
+    
+    assert trajectory.prompt_ids == [1, 2, 3]
+    assert trajectory.response_ids == [4, 5, 6, 7, 8]
+    assert trajectory.step_masks == [1, 1, 0, 1, 1]  # 历史部分 mask=0
+    
+    # 验证 VerlConverter 使用 step_masks
+    converter = VerlConverter(max_prompt_length=10, max_response_length=10, pad_token_id=0)
+    data_proto = converter.convert([trajectory])
+    
+    # response_mask 应该与 step_masks 一致
+    assert data_proto.batch['response_mask'][0].tolist() == [1, 1, 0, 1, 1, 0, 0, 0, 0, 0]
 ```
 
 ### 集成验证

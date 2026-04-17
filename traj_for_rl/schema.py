@@ -19,8 +19,10 @@ class Trajectory:
 
     Attributes:
         trajectory_id: 轨迹唯一标识（通常等于 session_id）
-        prompt_ids: Prompt 部分的 token IDs
-        response_ids: Response 部分的 token IDs
+        prompt_ids: Prompt 部分的 token IDs（第一轮对话的初始 prompt）
+        response_ids: Response 部分的 token IDs（包含所有轮次的 completion + 增量 prompt）
+        step_masks: 标记哪些 response token 参与 loss 计算（1=参与，0=不参与）
+                    多轮对话中，只有每轮生成的 completion_ids 参与 loss，历史部分 mask=0
         traj_reward: 轨迹级别奖励（先置空，由 reward_compute_cls 填充）
         step_rewards: 预留字段，Step 级别奖励
         metadata: 元数据（可包含 model、token 统计等）
@@ -28,6 +30,7 @@ class Trajectory:
     trajectory_id: str
     prompt_ids: List[int]
     response_ids: List[int]
+    step_masks: Optional[List[int]] = None  # 标记哪些 token 参与 loss
     traj_reward: Optional[float] = None  # 先置空，后填充
     step_rewards: Optional[List[float]] = None
     metadata: Dict[str, Any] = field(default_factory=dict)

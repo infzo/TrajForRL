@@ -15,7 +15,7 @@ import pytest
 import torch
 import numpy as np
 
-from traj_for_rl.dataclasses import Trajectory
+from traj_for_rl import Trajectory
 from traj_for_rl.verl_converter import VerlConverter
 
 

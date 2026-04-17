@@ -14,9 +14,9 @@ from typing import Any, Dict, List, Optional
 
 from transformers import PreTrainedTokenizer
 
-from traj_for_rl.dataclasses import Trajectory
+from traj_for_rl import Trajectory
 from traj_for_rl.vaee_handler import VAEEHandler
-from traj_for_rl.processors.defaults import default_trajectory_construct_cls, default_reward_compute_cls
+from traj_for_rl.impl import default_trajectory_construct_cls, default_reward_compute_cls
 
 
 # ============ Fixtures ============
@@ -178,7 +178,7 @@ class TestVAEEHandlerBoundary:
         """测试空 response_ids - 应抛出 ValueError"""
         # Setup
         mock_request_repository.get_all_by_session.return_value = [
-            {'token_ids': [1, 2, 3]}  # 没有 response_ids 和 response_text
+            {'response_ids': [4, 5, 6]}  # 没有 token_ids 和 prompt_text
         ]
 
         handler = VAEEHandler(
@@ -188,7 +188,7 @@ class TestVAEEHandlerBoundary:
         )
 
         # Execute & Verify
-        with pytest.raises(ValueError, match="non-empty response_ids"):
+        with pytest.raises(ValueError, match="non-empty prompt_ids"):
             await handler.process('test_session', mock_tokenizer)
 
     @pytest.mark.asyncio
@@ -281,8 +281,8 @@ class TestVAEEHandlerCustomProcessor:
         # Execute
         trajectory = await handler.process('test_session', mock_tokenizer)
 
-        # Verify
-        assert trajectory.traj_reward == 0.3  # 3 tokens * 0.1
+        # Verify (use approx for floating point comparison)
+        assert trajectory.traj_reward == pytest.approx(0.3)  # 3 tokens * 0.1
         assert trajectory.metadata['reward_type'] == 'length_based'
 
 
@@ -361,34 +361,25 @@ class TestVAEEHandlerMultiTurn:
     """多轮对话场景测试
 
     文档强调：一个 session 包含多条 records（多轮对话历史），
-    default_trajectory_construct_cls 取最后一条 record 作为完整轨迹。
+    default_trajectory_construct_cls 现在会拼接所有轮次，构建 step_masks。
     """
 
     @pytest.mark.asyncio
     async def test_handler_multi_turn_default_processor(self, mock_request_repository, mock_tokenizer):
-        """测试多轮对话 - 默认处理器取最后一条 record"""
-        # Setup - 模拟多轮对话
+        """测试多轮对话 - 默认处理器拼接所有轮次"""
+        # Setup - 模拟多轮对话（每条 record 的 token_ids 包含完整历史）
+        # Record 0: prompt=[1,2], response=[3,4]
+        # Record 1: prompt=[1,2,3,4,5,6,7], response=[8,9,10]（包含 Record 0 的历史）
         records = [
             {
                 'token_ids': [1, 2],
                 'response_ids': [3, 4],
                 'model': 'test-model',
-                'prompt_tokens': 2,
-                'completion_tokens': 2,
             },
             {
-                'token_ids': [5, 6, 7],
+                'token_ids': [1, 2, 3, 4, 5, 6, 7],  # 包含第一轮的历史
                 'response_ids': [8, 9, 10],
                 'model': 'test-model',
-                'prompt_tokens': 3,
-                'completion_tokens': 3,
-            },
-            {
-                'token_ids': [11, 12, 13, 14],
-                'response_ids': [15, 16, 17, 18],
-                'model': 'test-model',
-                'prompt_tokens': 4,
-                'completion_tokens': 4,
             },
         ]
         mock_request_repository.get_all_by_session.return_value = records
@@ -402,12 +393,16 @@ class TestVAEEHandlerMultiTurn:
         # Execute
         trajectory = await handler.process('multi_turn_session', mock_tokenizer)
 
-        # Verify - 取最后一条 record
+        # Verify - 拼接后的结果
         assert trajectory.trajectory_id == 'multi_turn_session'
-        assert trajectory.prompt_ids == [11, 12, 13, 14]
-        assert trajectory.response_ids == [15, 16, 17, 18]
-        assert trajectory.metadata['prompt_tokens'] == 4
-        assert trajectory.metadata['completion_tokens'] == 4
+        # prompt_ids = 第一条 record 的 prompt
+        assert trajectory.prompt_ids == [1, 2]
+        # response_ids = [C0] + [增量prompt] + [C1] = [3,4] + [5,6,7] + [8,9,10]
+        assert trajectory.response_ids == [3, 4, 5, 6, 7, 8, 9, 10]
+        # step_masks = [1,1] + [0,0,0] + [1,1,1]（只有 completion 参与 loss）
+        assert trajectory.step_masks == [1, 1, 0, 0, 0, 1, 1, 1]
+        # metadata 包含 n_steps
+        assert trajectory.metadata['n_steps'] == 2
 
     @pytest.mark.asyncio
     async def test_handler_multi_turn_with_tokenizer(self, mock_request_repository, mock_tokenizer):
