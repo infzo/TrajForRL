@@ -814,3 +814,9 @@ def test_converter_truncation():
 - 使用 TrajProxy 真实数据验证端到端流程
 - 对比 verl rollout 输出确保格式兼容
 - 验证 DataProto 可被 verl 训练流程正常消费
+
+### 参考代码仓库路径
+
+TrajProxy: /Users/liujiang/Workspace/Code/TrajProxy 参考输入数据格式
+Verl: /Users/liujiang/Workspace/Code/verl-0.7.0 参考输出数据格式
+Rllm: /Users/liujiang/Workspace/Code/rllm 参考数据转换过程
