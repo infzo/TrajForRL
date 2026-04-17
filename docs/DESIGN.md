@@ -899,6 +899,6 @@ def test_converter_truncation():
 
 ### 参考代码仓库路径
 
-TrajProxy: /Users/liujiang/Workspace/Code/TrajProxy 参考输入数据格式
-Verl: /Users/liujiang/Workspace/Code/verl-0.7.0 参考输出数据格式
-Rllm: /Users/liujiang/Workspace/Code/rllm 参考数据转换过程
+- TrajProxy: /Users/liujiang/Workspace/Code/TrajProxy 参考输入数据格式
+- Verl: /Users/liujiang/Workspace/Code/verl-0.7.0 参考输出数据格式
+- Rllm: /Users/liujiang/Workspace/Code/rllm 参考数据转换过程
