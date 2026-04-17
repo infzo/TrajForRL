@@ -198,13 +198,13 @@ class RewardComputeCls(Protocol):
         answer: 标准答案
     
     Returns:
-        float: 奖励值
+        Trajectory: 填充 traj_reward 后的 Trajectory 对象
     """
     def __call__(
         self,
         trajectory: Trajectory,
         answer: Optional[str] = None,
-    ) -> float: ...
+    ) -> Trajectory: ...
 
 
 # ============ Handler 类 ============
@@ -267,7 +267,7 @@ class VAEEHandler:
             raise ValueError("trajectory_construct_cls must return Trajectory with non-empty prompt_ids and response_ids")
 
         # 4. 奖励计算，填充 traj_reward
-        trajectory.traj_reward = self.reward_compute_cls(trajectory, answer)
+        trajectory = self.reward_compute_cls(trajectory, answer)
 
         return trajectory
 ```
@@ -340,12 +340,13 @@ def default_trajectory_construct_cls(
 def default_reward_compute_cls(
     trajectory: Trajectory,
     answer: Optional[str] = None,
-) -> float:
-    """默认奖励计算器 - 返回 0.0
+) -> Trajectory:
+    """默认奖励计算器 - 返回填充 traj_reward=0.0 的 Trajectory
     
     实际使用时应提供自定义的奖励计算函数。
     """
-    return 0.0
+    trajectory.traj_reward = 0.0
+    return trajectory
 ```
 
 ---
@@ -669,7 +670,7 @@ TrajForRL/
 | 注册机制 | 函数式注册 | 简单直接，无需继承 |
 | 多 Record 处理 | 可配置 | 通过 processor 控制聚合策略 |
 | Non-Tensor 字段 | 简化为 verl 原生 | 避免过度设计，按需添加 |
-| 奖励来源 | 模块内计算 | 由 reward_compute_cls 实现 |
+| 奖励来源 | 模块内计算 | 由 reward_compute_cls 实现，返回填充后的 Trajectory |
 | 模块封装 | 仅独立模块 | 上层直接调用，不需要 Facade |
 | 调用方式 | 异步调用 (async/await) | 适配上层异步训练框架 |
 | 数据获取 | Handler 内部调用 TrajProxy | 上层只需传入 session_id |
@@ -717,7 +718,7 @@ async def test_handler_with_default_processor():
     traj = await handler.process('test_session', mock_tokenizer)
     assert traj.prompt_ids == [1, 2, 3]
     assert traj.response_ids == [4, 5, 6]
-    assert traj.traj_reward == 0.0
+    assert traj.traj_reward == 0.0  # 由 reward_compute_cls 填充
 
 @pytest.mark.asyncio
 async def test_handler_with_custom_processor():
