@@ -28,17 +28,17 @@ flowchart TB
     end
 
     subgraph TrajForRL
-        subgraph 模块一: SingleTrajectoryHandler
+        subgraph 模块一: V-AEE
             direction TB
-            STH[SingleTrajectoryHandler<br/>async]
+            STH[V-AEE Handler<br/>async]
             TC[trajectory_construct_cls<br/>聚合+Tokenize]
             RC[reward_compute_cls<br/>奖励计算]
             STH --> TC
             STH --> RC
         end
 
-        subgraph 模块二: BatchVerlConverter
-            BVC[BatchVerlConverter]
+        subgraph 模块二: VerlConverter
+            BVC[VerlConverter]
         end
     end
 
@@ -58,7 +58,7 @@ flowchart TB
 
 ---
 
-## 模块一：SingleTrajectoryHandler
+## 模块一：VAEEHandler
 
 ### 职责
 
@@ -109,7 +109,7 @@ flowchart LR
 
 ```mermaid
 classDiagram
-    class SingleTrajectoryHandler {
+    class VAEEHandler {
         -request_repository: RequestRepository
         -trajectory_construct_cls: Callable
         -reward_compute_cls: Callable
@@ -126,8 +126,8 @@ classDiagram
         +metadata: Dict[str, Any]
     }
 
-    SingleTrajectoryHandler --> Trajectory: outputs
-    SingleTrajectoryHandler ..> RequestRepository: depends on
+    VAEEHandler --> Trajectory: outputs
+    VAEEHandler ..> RequestRepository: depends on
 ```
 
 ### 接口定义
@@ -209,8 +209,8 @@ class RewardComputeCls(Protocol):
 
 # ============ Handler 类 ============
 
-class SingleTrajectoryHandler:
-    """单轨迹处理器
+class VAEEHandler:
+    """V-AEE Handler - 单轨迹处理器
     
     处理单个 session 的多轮对话记录，输出标准化的 Trajectory 对象。
     内部调用 TrajProxy 获取 records。
@@ -350,7 +350,7 @@ def default_reward_compute_cls(
 
 ---
 
-## 模块二：BatchVerlConverter
+## 模块二：VerlConverter
 
 ### 职责
 
@@ -415,7 +415,7 @@ flowchart LR
 
 ```mermaid
 classDiagram
-    class BatchVerlConverter {
+    class VerlConverter {
         -max_prompt_length: int
         -max_response_length: int
         -pad_token_id: int
@@ -434,7 +434,7 @@ classDiagram
         +meta_info: Dict
     }
 
-    BatchVerlConverter --> DataProto: outputs
+    VerlConverter --> DataProto: outputs
 ```
 
 ### 接口定义
@@ -450,9 +450,10 @@ from tensordict import TensorDict
 logger = logging.getLogger(__name__)
 
 
-class BatchVerlConverter:
-    """批量格式转换器 - 输出 verl DataProto
+class VerlConverter:
+    """VerlConverter - 批量格式转换器
     
+    输出 verl DataProto 格式。
     配置在初始化时设定，输出固定在 CPU。
     """
 
@@ -640,16 +641,16 @@ class BatchVerlConverter:
 TrajForRL/
 ├── traj_for_rl/
 │   ├── __init__.py
-│   ├── handler.py           # SingleTrajectoryHandler
-│   ├── converter.py         # BatchVerlConverter
+│   ├── vaee_handler.py      # V-AEE Handler
+│   ├── verl_converter.py    # VerlConverter
 │   ├── dataclasses.py       # Trajectory
 │   └── processors/
 │       ├── __init__.py
 │       └── defaults.py      # default_trajectory_construct_cls, default_reward_compute_cls
 ├── tests/
 │   ├── __init__.py
-│   ├── test_handler.py
-│   └── test_converter.py
+│   ├── test_vaee_handler.py
+│   └── test_verl_converter.py
 ├── docs/
 │   └── DESIGN.md
 ├── CLAUDE.md
@@ -681,7 +682,8 @@ TrajForRL/
 | 截断策略 | 静默截断 | 参考 rllm 和 verl 的实现 |
 | Device | 固定 CPU | 输出 Tensor 固定在 CPU，上层决定是否转移到 GPU |
 | 日志框架 | 使用 logging | 使用 Python 标准库 logging |
-| 错误处理 | trajectory_construct_cls 处理 | 空数据等错误由 trajectory_construct_cls 决定如何处理 |
+| VAEEHandler 类名 | V-AEE Handler | 模块一的核心处理器类名 |
+| VerlConverter 类名 | VerlConverter | 模块二的转换器类名 |
 
 ---
 
@@ -690,7 +692,7 @@ TrajForRL/
 ### 单元测试
 
 ```python
-# tests/test_handler.py
+# tests/test_vaee_handler.py
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 from transformers import AutoTokenizer
@@ -707,7 +709,7 @@ async def test_handler_with_default_processor():
     # Mock tokenizer
     mock_tokenizer = MagicMock()
     
-    handler = SingleTrajectoryHandler(
+    handler = VAEEHandler(
         request_repository=mock_repo,
         trajectory_construct_cls=default_trajectory_construct_cls,
         reward_compute_cls=default_reward_compute_cls,
@@ -741,7 +743,7 @@ async def test_handler_with_custom_processor():
     
     mock_tokenizer = MagicMock()
     
-    handler = SingleTrajectoryHandler(
+    handler = VAEEHandler(
         request_repository=mock_repo,
         trajectory_construct_cls=custom_construct_cls,
         reward_compute_cls=default_reward_compute_cls,
@@ -751,10 +753,10 @@ async def test_handler_with_custom_processor():
     assert traj.response_ids == [4, 5, 6, 9, 10]
 
 
-# tests/test_converter.py
+# tests/test_verl_converter.py
 def test_converter_basic():
     """测试基本转换"""
-    converter = BatchVerlConverter(
+    converter = VerlConverter(
         max_prompt_length=10,
         max_response_length=10,
         pad_token_id=0,
@@ -783,7 +785,7 @@ def test_converter_basic():
 
 def test_converter_truncation():
     """测试截断"""
-    converter = BatchVerlConverter(
+    converter = VerlConverter(
         max_prompt_length=5,
         max_response_length=5,
         pad_token_id=0,
