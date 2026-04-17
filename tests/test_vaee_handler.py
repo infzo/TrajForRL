@@ -353,3 +353,197 @@ class TestVAEEHandlerMetadata:
 
         # Verify
         assert trajectory.metadata['data_source'] == 'gsm8k'
+
+
+# ============ 多轮对话场景测试 ============
+
+class TestVAEEHandlerMultiTurn:
+    """多轮对话场景测试
+
+    文档强调：一个 session 包含多条 records（多轮对话历史），
+    default_trajectory_construct_cls 取最后一条 record 作为完整轨迹。
+    """
+
+    @pytest.mark.asyncio
+    async def test_handler_multi_turn_default_processor(self, mock_request_repository, mock_tokenizer):
+        """测试多轮对话 - 默认处理器取最后一条 record"""
+        # Setup - 模拟多轮对话
+        records = [
+            {
+                'token_ids': [1, 2],
+                'response_ids': [3, 4],
+                'model': 'test-model',
+                'prompt_tokens': 2,
+                'completion_tokens': 2,
+            },
+            {
+                'token_ids': [5, 6, 7],
+                'response_ids': [8, 9, 10],
+                'model': 'test-model',
+                'prompt_tokens': 3,
+                'completion_tokens': 3,
+            },
+            {
+                'token_ids': [11, 12, 13, 14],
+                'response_ids': [15, 16, 17, 18],
+                'model': 'test-model',
+                'prompt_tokens': 4,
+                'completion_tokens': 4,
+            },
+        ]
+        mock_request_repository.get_all_by_session.return_value = records
+
+        handler = VAEEHandler(
+            request_repository=mock_request_repository,
+            trajectory_construct_cls=default_trajectory_construct_cls,
+            reward_compute_cls=default_reward_compute_cls,
+        )
+
+        # Execute
+        trajectory = await handler.process('multi_turn_session', mock_tokenizer)
+
+        # Verify - 取最后一条 record
+        assert trajectory.trajectory_id == 'multi_turn_session'
+        assert trajectory.prompt_ids == [11, 12, 13, 14]
+        assert trajectory.response_ids == [15, 16, 17, 18]
+        assert trajectory.metadata['prompt_tokens'] == 4
+        assert trajectory.metadata['completion_tokens'] == 4
+
+    @pytest.mark.asyncio
+    async def test_handler_multi_turn_with_tokenizer(self, mock_request_repository, mock_tokenizer):
+        """测试多轮对话 - 使用 tokenizer 从文本 tokenize"""
+        # Setup
+        records = [
+            {
+                'prompt_text': 'First turn',
+                'response_text': 'First response',
+                'model': 'test-model',
+            },
+            {
+                'prompt_text': 'Second turn',
+                'response_text': 'Second response',
+                'model': 'test-model',
+            },
+        ]
+        mock_request_repository.get_all_by_session.return_value = records
+
+        handler = VAEEHandler(
+            request_repository=mock_request_repository,
+            trajectory_construct_cls=default_trajectory_construct_cls,
+            reward_compute_cls=default_reward_compute_cls,
+        )
+
+        # Execute
+        trajectory = await handler.process('multi_turn_session', mock_tokenizer)
+
+        # Verify - 最后一条 record 被 tokenize
+        assert len(trajectory.prompt_ids) > 0
+        assert len(trajectory.response_ids) > 0
+        # 验证 tokenizer.encode 被调用（mock 实现）
+        mock_tokenizer.encode.assert_called()
+
+    @pytest.mark.asyncio
+    async def test_handler_multi_turn_custom_aggregation(self, mock_request_repository, mock_tokenizer):
+        """测试多轮对话 - 自定义聚合所有 records"""
+        # Setup
+        records = [
+            {'token_ids': [1, 2], 'response_ids': [3, 4]},
+            {'token_ids': [5, 6], 'response_ids': [7, 8]},
+            {'token_ids': [9, 10], 'response_ids': [11, 12]},
+        ]
+        mock_request_repository.get_all_by_session.return_value = records
+
+        # 自定义：聚合所有 records
+        def aggregate_all_construct_cls(
+            session_id: str,
+            records: List[Dict[str, Any]],
+            tokenizer: PreTrainedTokenizer,
+            answer: Optional[str] = None
+        ) -> Trajectory:
+            all_prompt_ids = []
+            all_response_ids = []
+            for r in records:
+                all_prompt_ids.extend(r.get('token_ids', []))
+                all_response_ids.extend(r.get('response_ids', []))
+            return Trajectory(
+                trajectory_id=session_id,
+                prompt_ids=all_prompt_ids,
+                response_ids=all_response_ids,
+            )
+
+        handler = VAEEHandler(
+            request_repository=mock_request_repository,
+            trajectory_construct_cls=aggregate_all_construct_cls,
+            reward_compute_cls=default_reward_compute_cls,
+        )
+
+        # Execute
+        trajectory = await handler.process('aggregate_session', mock_tokenizer)
+
+        # Verify - 所有 records 被聚合
+        assert trajectory.prompt_ids == [1, 2, 5, 6, 9, 10]
+        assert trajectory.response_ids == [3, 4, 7, 8, 11, 12]
+
+
+# ============ 异常传播测试 ============
+
+class TestVAEEHandlerException:
+    """异常传播测试"""
+
+    @pytest.mark.asyncio
+    async def test_handler_repository_exception(self, mock_request_repository, mock_tokenizer):
+        """测试 RequestRepository 抛出异常时正确传播"""
+        # Setup
+        mock_request_repository.get_all_by_session.side_effect = ConnectionError("Database connection failed")
+
+        handler = VAEEHandler(
+            request_repository=mock_request_repository,
+            trajectory_construct_cls=default_trajectory_construct_cls,
+            reward_compute_cls=default_reward_compute_cls,
+        )
+
+        # Execute & Verify
+        with pytest.raises(ConnectionError, match="Database connection failed"):
+            await handler.process('test_session', mock_tokenizer)
+
+    @pytest.mark.asyncio
+    async def test_handler_trajectory_construct_exception(self, mock_request_repository, mock_tokenizer):
+        """测试 trajectory_construct_cls 抛出异常时正确传播"""
+        # Setup
+        mock_request_repository.get_all_by_session.return_value = [
+            {'token_ids': [1, 2, 3], 'response_ids': [4, 5, 6]}
+        ]
+
+        def failing_construct_cls(session_id, records, tokenizer, answer):
+            raise RuntimeError("Construct failed")
+
+        handler = VAEEHandler(
+            request_repository=mock_request_repository,
+            trajectory_construct_cls=failing_construct_cls,
+            reward_compute_cls=default_reward_compute_cls,
+        )
+
+        # Execute & Verify
+        with pytest.raises(RuntimeError, match="Construct failed"):
+            await handler.process('test_session', mock_tokenizer)
+
+    @pytest.mark.asyncio
+    async def test_handler_reward_compute_exception(self, mock_request_repository, mock_tokenizer):
+        """测试 reward_compute_cls 抛出异常时正确传播"""
+        # Setup
+        mock_request_repository.get_all_by_session.return_value = [
+            {'token_ids': [1, 2, 3], 'response_ids': [4, 5, 6]}
+        ]
+
+        def failing_reward_cls(trajectory, answer):
+            raise RuntimeError("Reward compute failed")
+
+        handler = VAEEHandler(
+            request_repository=mock_request_repository,
+            trajectory_construct_cls=default_trajectory_construct_cls,
+            reward_compute_cls=failing_reward_cls,
+        )
+
+        # Execute & Verify
+        with pytest.raises(RuntimeError, match="Reward compute failed"):
+            await handler.process('test_session', mock_tokenizer)

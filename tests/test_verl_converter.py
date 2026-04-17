@@ -540,8 +540,8 @@ class TestVerlConverterTensorValues:
         expected_rewards = [0.0, 0.0, 1.0, 0.0, 0.0]
         assert data_proto.batch['token_level_rewards'][0].tolist() == expected_rewards
 
-        # Verify token_level_scores: 暂与 rewards 相同
-        assert data_proto.batch['token_level_scores'][0].tolist() == [0.0, 0.0, 0.0, 0.0, 0.0]
+        # Verify token_level_scores: 文档说"暂与 rewards 相同"
+        assert data_proto.batch['token_level_scores'][0].tolist() == expected_rewards
 
     def test_converter_tensor_dtype(self, converter, sample_trajectories):
         """验证 tensor 数据类型"""
@@ -566,3 +566,277 @@ class TestVerlConverterTensorValues:
         # Verify all tensors on CPU
         for key in data_proto.batch.keys():
             assert data_proto.batch[key].device.type == 'cpu'
+
+
+# ============ 空 Response 边界测试 ============
+
+class TestVerlConverterEmptyResponse:
+    """空 Response 边界测试
+
+    文档 Corner Case：response_length = 0 时跳过，不放置 reward。
+    注意：VAEEHandler 会拦截空 response_ids，但 VerlConverter 应独立处理此边界。
+    """
+
+    def test_converter_zero_length_response(self, converter):
+        """测试空 response 时 reward 不放置"""
+        # Setup
+        trajectories = [
+            Trajectory(
+                trajectory_id='test_zero_response',
+                prompt_ids=[1, 2, 3],
+                response_ids=[],  # 空 response
+                traj_reward=1.0,
+            )
+        ]
+
+        # Execute
+        data_proto = converter.convert(trajectories)
+
+        # Verify: response 全为 PAD
+        assert data_proto.batch['responses'][0].tolist() == [0, 0, 0, 0, 0]
+        # Verify: response_mask 全为 0
+        assert data_proto.batch['response_mask'][0].tolist() == [0, 0, 0, 0, 0]
+        # Verify: reward tensor 全为 0（因为 length = 0）
+        assert data_proto.batch['token_level_rewards'][0].tolist() == [0.0, 0.0, 0.0, 0.0, 0.0]
+
+    def test_converter_zero_length_response_batch(self, converter):
+        """测试批量中包含空 response"""
+        # Setup
+        trajectories = [
+            Trajectory(
+                trajectory_id='test_normal',
+                prompt_ids=[1],
+                response_ids=[2, 3],
+                traj_reward=1.0,
+            ),
+            Trajectory(
+                trajectory_id='test_zero_response',
+                prompt_ids=[4],
+                response_ids=[],  # 空 response
+                traj_reward=0.5,
+            ),
+            Trajectory(
+                trajectory_id='test_normal_2',
+                prompt_ids=[5],
+                response_ids=[6],
+                traj_reward=0.3,
+            ),
+        ]
+
+        # Execute
+        data_proto = converter.convert(trajectories)
+
+        # Verify batch size
+        assert len(data_proto) == 3
+
+        # Verify: 第一个正常
+        assert data_proto.batch['token_level_rewards'][0].tolist() == [0.0, 1.0, 0.0, 0.0, 0.0]
+        # Verify: 第二个空 response，reward 不放置
+        assert data_proto.batch['token_level_rewards'][1].tolist() == [0.0, 0.0, 0.0, 0.0, 0.0]
+        # Verify: 第三个正常
+        assert data_proto.batch['token_level_rewards'][2].tolist() == [0.3, 0.0, 0.0, 0.0, 0.0]
+
+
+# ============ Non-Tensor 字段部分缺失测试 ============
+
+class TestVerlConverterPartialMetadata:
+    """Non-Tensor 字段部分缺失测试
+
+    文档使用 all() 判断，当部分 trajectory 缺失字段时，该字段不应出现在 non_tensor_batch 中。
+    """
+
+    def test_converter_partial_ground_truth(self, converter):
+        """测试部分 trajectory 缺失 ground_truth"""
+        # Setup
+        trajectories = [
+            Trajectory(
+                trajectory_id='test_1',
+                prompt_ids=[1],
+                response_ids=[2],
+                traj_reward=1.0,
+                metadata={'ground_truth': 'answer_1'},
+            ),
+            Trajectory(
+                trajectory_id='test_2',
+                prompt_ids=[3],
+                response_ids=[4],
+                traj_reward=0.5,
+                metadata={},  # 无 ground_truth
+            ),
+        ]
+
+        # Execute
+        data_proto = converter.convert(trajectories)
+
+        # Verify: ground_truth 不应出现在 non_tensor_batch（因为 not all）
+        assert 'ground_truth' not in data_proto.non_tensor_batch
+
+        # Verify: uid 仍然存在
+        assert 'uid' in data_proto.non_tensor_batch
+        assert data_proto.non_tensor_batch['uid'][0] == 'test_1'
+        assert data_proto.non_tensor_batch['uid'][1] == 'test_2'
+
+    def test_converter_partial_data_source(self, converter):
+        """测试部分 trajectory 缺失 data_source"""
+        # Setup
+        trajectories = [
+            Trajectory(
+                trajectory_id='test_1',
+                prompt_ids=[1],
+                response_ids=[2],
+                traj_reward=1.0,
+                metadata={'data_source': 'gsm8k'},
+            ),
+            Trajectory(
+                trajectory_id='test_2',
+                prompt_ids=[3],
+                response_ids=[4],
+                traj_reward=0.5,
+                metadata={'ground_truth': 'answer'},  # 有其他字段但无 data_source
+            ),
+        ]
+
+        # Execute
+        data_proto = converter.convert(trajectories)
+
+        # Verify: data_source 不应出现在 non_tensor_batch
+        assert 'data_source' not in data_proto.non_tensor_batch
+
+    def test_converter_no_metadata_fields(self, converter):
+        """测试所有 trajectory 都无 ground_truth/data_source"""
+        # Setup
+        trajectories = [
+            Trajectory(
+                trajectory_id='test_1',
+                prompt_ids=[1],
+                response_ids=[2],
+                traj_reward=1.0,
+                metadata={},
+            ),
+            Trajectory(
+                trajectory_id='test_2',
+                prompt_ids=[3],
+                response_ids=[4],
+                traj_reward=0.5,
+                metadata={},
+            ),
+        ]
+
+        # Execute
+        data_proto = converter.convert(trajectories)
+
+        # Verify: 只有 uid
+        assert 'uid' in data_proto.non_tensor_batch
+        assert 'ground_truth' not in data_proto.non_tensor_batch
+        assert 'data_source' not in data_proto.non_tensor_batch
+
+    def test_converter_all_have_metadata_fields(self, converter):
+        """测试所有 trajectory 都有 ground_truth/data_source"""
+        # Setup
+        trajectories = [
+            Trajectory(
+                trajectory_id='test_1',
+                prompt_ids=[1],
+                response_ids=[2],
+                traj_reward=1.0,
+                metadata={'ground_truth': 'answer_1', 'data_source': 'gsm8k'},
+            ),
+            Trajectory(
+                trajectory_id='test_2',
+                prompt_ids=[3],
+                response_ids=[4],
+                traj_reward=0.5,
+                metadata={'ground_truth': 'answer_2', 'data_source': 'math'},
+            ),
+        ]
+
+        # Execute
+        data_proto = converter.convert(trajectories)
+
+        # Verify: 所有字段都存在
+        assert 'uid' in data_proto.non_tensor_batch
+        assert 'ground_truth' in data_proto.non_tensor_batch
+        assert 'data_source' in data_proto.non_tensor_batch
+        assert data_proto.non_tensor_batch['ground_truth'][0] == 'answer_1'
+        assert data_proto.non_tensor_batch['ground_truth'][1] == 'answer_2'
+        assert data_proto.non_tensor_batch['data_source'][0] == 'gsm8k'
+        assert data_proto.non_tensor_batch['data_source'][1] == 'math'
+
+
+# ============ 截断后 mask/position 验证测试 ============
+
+class TestVerlConverterTruncationMask:
+    """截断后的 attention_mask 和 position_ids 验证"""
+
+    def test_converter_truncation_attention_mask(self, converter):
+        """测试截断后的 attention_mask 正确性"""
+        # Setup - prompt 超长
+        trajectories = [
+            Trajectory(
+                trajectory_id='test',
+                prompt_ids=[1, 2, 3, 4, 5, 6, 7, 8],  # 被截断为 [4,5,6,7,8]
+                response_ids=[9, 10, 11],
+                traj_reward=1.0,
+            )
+        ]
+
+        # Execute
+        data_proto = converter.convert(trajectories)
+
+        # Verify: 截断后 prompt 无填充，全有效
+        # prompt: [4, 5, 6, 7, 8] -> mask: [1, 1, 1, 1, 1]
+        # response: [9, 10, 11, PAD, PAD] -> mask: [1, 1, 1, 0, 0]
+        expected_mask = [1, 1, 1, 1, 1, 1, 1, 1, 0, 0]
+        assert data_proto.batch['attention_mask'][0].tolist() == expected_mask
+
+    def test_converter_truncation_position_ids(self, converter):
+        """测试截断后的 position_ids 正确性"""
+        # Setup - response 超长
+        trajectories = [
+            Trajectory(
+                trajectory_id='test',
+                prompt_ids=[1, 2, 3],
+                response_ids=[4, 5, 6, 7, 8, 9, 10],  # 被截断为 [4,5,6,7,8]
+                traj_reward=1.0,
+            )
+        ]
+
+        # Execute
+        data_proto = converter.convert(trajectories)
+
+        # Verify: position_ids 正确计算
+        # prompt: [PAD, PAD, 1, 2, 3] -> mask: [0, 0, 1, 1, 1]
+        # response: [4, 5, 6, 7, 8] -> mask: [1, 1, 1, 1, 1]
+        # attention_mask: [0, 0, 1, 1, 1, 1, 1, 1, 1, 1]
+        # position_ids: [0, 0, 0, 1, 2, 3, 4, 5, 6, 7]
+        expected_position_ids = [0, 0, 0, 1, 2, 3, 4, 5, 6, 7]
+        assert data_proto.batch['position_ids'][0].tolist() == expected_position_ids
+
+    def test_converter_both_truncation_mask_position(self, converter):
+        """测试 prompt 和 response 都截断后的 mask 和 position"""
+        # Setup
+        trajectories = [
+            Trajectory(
+                trajectory_id='test',
+                prompt_ids=[1, 2, 3, 4, 5, 6, 7, 8],
+                response_ids=[9, 10, 11, 12, 13, 14, 15],
+                traj_reward=1.0,
+            )
+        ]
+
+        # Execute
+        data_proto = converter.convert(trajectories)
+
+        # Verify: 截断后无填充
+        # prompt: [4, 5, 6, 7, 8] -> mask: [1, 1, 1, 1, 1]
+        # response: [9, 10, 11, 12, 13] -> mask: [1, 1, 1, 1, 1]
+        expected_mask = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+        assert data_proto.batch['attention_mask'][0].tolist() == expected_mask
+
+        # position_ids: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+        expected_position_ids = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+        assert data_proto.batch['position_ids'][0].tolist() == expected_position_ids
+
+        # reward 在截断后的最后一个有效 token (index 9)
+        expected_rewards = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]
+        assert data_proto.batch['token_level_rewards'][0].tolist() == expected_rewards
