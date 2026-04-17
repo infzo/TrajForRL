@@ -626,6 +626,39 @@ class VerlConverter:
 
 **Non-Tensor 字段代码来源**: `verl/trainer/ppo/ray_trainer.py:255-256`, `verl/docs/preparation/reward_function.rst:29-33`
 
+### 字段来源与转换说明
+
+#### token_level_rewards 来源
+
+`token_level_rewards` 由 `Trajectory.traj_reward` 转换而来：
+- **位置**: 放在 response 最后一个有效 token 位置
+- **转换逻辑**: 参考 `rllm/experimental/verl/transform.py:388-394`
+```python
+# rllm 转换示例
+batch.batch["token_level_rewards"] = batch.batch["traj_rewards"]
+```
+
+#### uid 命名要求
+
+**必须命名为 `uid`**（而非 `trajectory_id`），原因：
+- verl GRPO advantage 计算使用 `data.non_tensor_batch["uid"]` 进行 grouping
+- 代码参考: `verl/trainer/ppo/ray_trainer.py:242`
+
+#### ground_truth 和 data_source 用途
+
+| 字段 | 用途 | 代码参考 |
+|------|------|---------|
+| `ground_truth` | reward 函数计算时，与模型生成的 response 进行对比 | `verl/docs/preparation/reward_function.rst:28` |
+| `data_source` | 索引对应的 reward 函数（不同数据集使用不同 reward 函数） | `verl/docs/preparation/reward_function.rst:31` |
+
+**使用示例** (参考 `verl/docs/preparation/reward_function.rst:60`):
+```python
+def my_reward_fn(data_source, solution_str, ground_truth, extra_info=None):
+    # data_source: 数据集名称，用于选择不同的 reward 函数
+    # ground_truth: 标准答案，用于与 solution_str 对比
+    return compute_score(ground_truth, solution_str)
+```
+
 ---
 
 ## TrajProxy Record 结构
@@ -733,6 +766,45 @@ TrajForRL/
 ├── CLAUDE.md
 └── pyproject.toml
 ```
+
+---
+
+## Corner Case 处理
+
+### 输入边界条件
+
+| 场景 | 条件 | 处理方式 | 代码证据 |
+|------|------|---------|---------|
+| 空 records | `records = []` | 抛出 ValueError | `VAEEHandler.process()` |
+| 空 prompt_ids | `prompt_ids = []` 或 `None` | 抛出 ValueError | `VAEEHandler.process()` |
+| 空 response_ids | `response_ids = []` 或 `None` | 抛出 ValueError | `VAEEHandler.process()` |
+| token_ids 不存在 | `last_record.get('token_ids') = None` | 使用 tokenizer.encode | `default_trajectory_construct_cls` |
+| traj_reward 为 None | `trajectory.traj_reward = None` | 默认填充 0.0 | 参考 `rllm/experimental/verl/transform.py:224` |
+
+### 填充和截断
+
+| 场景 | 条件 | 处理方式 | 代码证据 |
+|------|------|---------|---------|
+| prompt 超长 | `len > max_prompt_length` | 左截断（取最后 max_length 个） | `_pad_left()` |
+| response 超长 | `len > max_response_length` | 右截断（取前 max_length 个） | `_pad_right()` |
+| prompt 不足 | `len < max_prompt_length` | 左填充 | `_pad_left()` |
+| response 不足 | `len < max_response_length` | 右填充 | `_pad_right()` |
+
+### Reward 处理边界
+
+| 场景 | 条件 | 处理方式 | 代码证据 |
+|------|------|---------|---------|
+| reward 放置 | 正常情况 | 在 response 最后有效 token 位置 | `_build_rewards()` |
+| response_length = 0 | `resp_len = 0` | 跳过，不放置 reward（tensor 保持 0） | `_build_rewards()` 中 `length > 0` 判断 |
+| reward 为 None | `reward is None` | 不放置 reward | `_build_rewards()` 中 `reward is not None` 判断 |
+
+### position_ids 特殊情况
+
+| 场景 | 条件 | 处理方式 |
+|------|------|---------|
+| 全 padding 序列 | `attention_mask = [0, 0, 0]` | position_ids = `[0, 0, 0]`（cumsum 计算） |
+| 左填充 prompt | `[PAD, PAD, tok1, tok2]` | position_ids = `[0, 0, 0, 1]` |
+| 多模态输入 | Qwen-VL 模型 | 特殊 4D position_ids（后续扩展） |
 
 ---
 
@@ -902,3 +974,37 @@ def test_converter_truncation():
 - TrajProxy: /Users/liujiang/Workspace/Code/TrajProxy 参考输入数据格式
 - Verl: /Users/liujiang/Workspace/Code/verl-0.7.0 参考输出数据格式
 - Rllm: /Users/liujiang/Workspace/Code/rllm 参考数据转换过程
+
+---
+
+## 代码证据索引
+
+### TrajProxy
+
+| 文件路径 | 行号 | 说明 |
+|---------|------|------|
+| `traj_proxy/store/models.py` | 30-86 | RequestRecord 数据类定义 |
+
+### verl
+
+| 文件路径 | 行号 | 说明 |
+|---------|------|------|
+| `verl/protocol.py` | 328-339 | DataProto 定义 |
+| `verl/trainer/ppo/core_algos.py` | 214 | token_level_rewards 参数定义 |
+| `verl/trainer/ppo/ray_trainer.py` | 240 | GRPO advantage 计算使用 token_level_rewards |
+| `verl/trainer/ppo/ray_trainer.py` | 242 | GRPO grouping 使用 uid |
+| `verl/trainer/ppo/ray_trainer.py` | 481 | token_level_scores 用于日志 |
+| `docs/preparation/reward_function.rst` | 28-33 | ground_truth/data_source 说明 |
+
+### rllm
+
+| 文件路径 | 行号 | 说明 |
+|---------|------|------|
+| `rllm/agents/agent.py` | 15-61 | Step 类定义 |
+| `rllm/agents/agent.py` | 145-210 | Trajectory 类定义 |
+| `rllm/agents/agent.py` | 213-244 | Episode 类定义 |
+| `rllm/experimental/verl/transform.py` | 130-203 | DataProto 构建逻辑 |
+| `rllm/experimental/verl/transform.py` | 160 | position_ids 计算 |
+| `rllm/experimental/verl/transform.py` | 388-394 | token_level_rewards 转换 |
+| `rllm/experimental/verl/dataclass.py` | 1-84 | ProcessedStepData 和 AccumulatedData |
+| `rllm/experimental/fully_async/protocol.py` | 80-130 | Sequence 类定义（多 step 处理）
