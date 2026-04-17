@@ -1,0 +1,37 @@
+<component name="InspectionProjectProfileManager">
+  <profile version="1.0">
+    <option name="myName" value="Project Default" />
+    <inspection_tool class="PyPackageRequirementsInspection" enabled="true" level="WARNING" enabled_by_default="true">
+      <option name="ignoredPackages">
+        <list>
+          <option value="APScheduler" />
+          <option value="tushare" />
+          <option value="pandas" />
+          <option value="loguru" />
+          <option value="streamlit" />
+          <option value="plotly" />
+          <option value="akshare" />
+          <option value="PyMySQL" />
+          <option value="fastapi" />
+          <option value="uvicorn" />
+          <option value="pydantic" />
+          <option value="pyyaml" />
+          <option value="ray" />
+          <option value="httpx" />
+          <option value="psycopg" />
+          <option value="transformers" />
+          <option value="jinja2" />
+          <option value="huggingface-hub" />
+          <option value="regex" />
+        </list>
+      </option>
+    </inspection_tool>
+    <inspection_tool class="PyStubPackagesAdvertiser" enabled="true" level="WARNING" enabled_by_default="true">
+      <option name="ignoredPackages">
+        <list>
+          <option value="scipy-stubs==1.17.0.1" />
+        </list>
+      </option>
+    </inspection_tool>
+  </profile>
+</component>
