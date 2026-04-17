@@ -13,8 +13,8 @@
 
 **首版范围：**
 - 支持纯文本轨迹处理
-- 支持轨迹级奖励（traj_reward）
-- 预留 step_rewards 字段供后续扩展
+- 支持轨迹级奖励（traj_reward → token_level_rewards）
+- 预留 token_level_scores 字段供后续扩展
 
 ---
 
@@ -516,14 +516,24 @@ class VerlConverter:
         response_mask = (responses_batch != self.pad_token_id).long()
 
         # 6. rewards (放在 response 最后一个有效 token 位置)
-        traj_rewards = self._build_rewards(
+        token_level_rewards = self._build_rewards(
             [t.traj_reward for t in trajectories],
             [len(t.response_ids) for t in trajectories],
             self.max_response_length
         )
-        step_rewards = torch.zeros_like(traj_rewards)  # 暂不实现
+        token_level_scores = torch.zeros_like(token_level_rewards)  # 暂与 rewards 相同
 
-        # 7. 组装 DataProto（仅使用 verl 原生字段）
+        # 7. 构建 non_tensor_batch（用于 verl 训练流程）
+        non_tensor_batch = {
+            'uid': np.array([t.trajectory_id for t in trajectories]),
+        }
+        # 可选字段：ground_truth, data_source（从 metadata 获取）
+        if all('ground_truth' in t.metadata for t in trajectories):
+            non_tensor_batch['ground_truth'] = np.array([t.metadata['ground_truth'] for t in trajectories])
+        if all('data_source' in t.metadata for t in trajectories):
+            non_tensor_batch['data_source'] = np.array([t.metadata['data_source'] for t in trajectories])
+
+        # 8. 组装 DataProto（使用 verl 原生字段命名）
         batch = TensorDict({
             'input_ids': input_ids,
             'attention_mask': attention_mask,
@@ -531,11 +541,11 @@ class VerlConverter:
             'prompts': prompts_batch,
             'responses': responses_batch,
             'response_mask': response_mask,
-            'traj_rewards': traj_rewards,
-            'step_rewards': step_rewards,
+            'token_level_rewards': token_level_rewards,
+            'token_level_scores': token_level_scores,
         }, batch_size=len(trajectories))
 
-        return DataProto(batch=batch)
+        return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
 
     def _pad_left(self, sequences: List[List[int]], max_len: int, pad_id: int) -> torch.Tensor:
         """左填充序列，超出长度时从左侧截断"""
@@ -591,6 +601,8 @@ class VerlConverter:
 
 ## DataProto 字段映射
 
+**代码来源**: `verl/protocol.py:328-339`, `verl/trainer/ppo/core_algos.py:214`, `verl/trainer/ppo/ray_trainer.py:240`
+
 ### Tensor 字段（batch）
 
 | 字段名 | 类型 | 形状 | 说明 |
@@ -601,33 +613,97 @@ class VerlConverter:
 | `prompts` | LongTensor | [bs, max_prompt_length] | Prompt（左填充） |
 | `responses` | LongTensor | [bs, max_response_length] | Response（右填充） |
 | `response_mask` | LongTensor | [bs, max_response_length] | 有效 response token |
-| `traj_rewards` | FloatTensor | [bs, max_response_length] | 奖励在最后有效位 |
-| `step_rewards` | FloatTensor | [bs, max_response_length] | 暂为零（预留） |
+| `token_level_rewards` | FloatTensor | [bs, max_response_length] | 奖励在最后有效位 |
+| `token_level_scores` | FloatTensor | [bs, max_response_length] | 暂与 rewards 相同 |
 
 ### Non-Tensor 字段（non_tensor_batch）
 
-首版不使用 non_tensor_batch 字段。如上层训练流程需要，可按需添加。
+| 字段名 | 类型 | 说明 |
+|--------|------|------|
+| `uid` | ndarray[str] | 样本唯一标识（用于 GRPO advantage 计算） |
+| `ground_truth` | ndarray[object] | 标准答案（可选，用于 reward 计算） |
+| `data_source` | ndarray[str] | 数据来源（可选） |
+
+**Non-Tensor 字段代码来源**: `verl/trainer/ppo/ray_trainer.py:255-256`, `verl/docs/preparation/reward_function.rst:29-33`
 
 ---
 
 ## TrajProxy Record 结构
 
-从 TrajProxy 获取的单条记录（`RequestRecord`）包含以下关键字段：
+从 TrajProxy 获取的单条记录（`RequestRecord`）包含以下字段。
+
+**代码来源**: `TrajProxy/traj_proxy/store/models.py:30-86`
+
+### 标识字段
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
-| `unique_id` | str | 唯一标识 |
+| `unique_id` | str | 全局唯一标识 |
+| `request_id` | str | 请求 ID |
 | `session_id` | str | 会话 ID（多轮对话共用） |
+| `run_id` | Optional[str] | 运行 ID（区分不同训练运行） |
+
+### 模型信息
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
 | `model` | str | 模型名称 |
-| `messages` | List[Any] | 消息列表 |
-| `token_ids` | Optional[List[int]] | Prompt Token IDs |
-| `response_ids` | Optional[List[int]] | Response Token IDs |
-| `full_conversation_token_ids` | Optional[List[int]] | 完整对话 Token IDs |
-| `response_text` | Optional[str] | 响应文本 |
+| `tokenizer_path` | Optional[str] | Tokenizer 路径 |
+
+### 请求数据（三阶段）
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `messages` | List[Any] | 消息列表（OpenAI 格式） |
+| `raw_request` | Optional[Any] | 阶段1: 完整 OpenAI 请求 |
+| `raw_response` | Optional[Any] | 阶段1: 完整 OpenAI 响应 |
+| `text_request` | Optional[Any] | 阶段2: 文本推理请求 |
+| `text_response` | Optional[Any] | 阶段2: 文本推理响应 |
+| `token_request` | Optional[Any] | 阶段3: Token 推理请求 |
+| `token_response` | Optional[Any] | 阶段3: Token 推理响应 |
+
+### Token 数据
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
 | `prompt_text` | Optional[str] | Prompt 文本 |
+| `token_ids` | Optional[List[int]] | Prompt Token IDs |
+| `response_text` | Optional[str] | 响应文本 |
+| `response_ids` | Optional[List[int]] | Response Token IDs |
+| `full_conversation_text` | Optional[str] | 完整对话文本 |
+| `full_conversation_token_ids` | Optional[List[int]] | 完整对话 Token IDs |
+
+### 统计信息
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
 | `prompt_tokens` | Optional[int] | Prompt Token 数量 |
 | `completion_tokens` | Optional[int] | Completion Token 数量 |
+| `total_tokens` | Optional[int] | 总 Token 数量 |
+| `cache_hit_tokens` | int | 缓存命中 Token 数量 |
+| `processing_duration_ms` | Optional[float] | 处理耗时（毫秒） |
+
+### 时间信息
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `start_time` | Optional[datetime] | 请求开始时间 |
+| `end_time` | Optional[datetime] | 请求结束时间 |
+| `created_at` | Optional[datetime] | 记录创建时间 |
+
+### 错误信息
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
 | `error` | Optional[str] | 错误信息 |
+| `error_traceback` | Optional[str] | 错误堆栈 |
+
+### 归档信息
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `archive_location` | Optional[str] | 归档位置（NULL=活跃） |
+| `archived_at` | Optional[datetime] | 归档时间 |
 
 **records 关系说明：**
 - 一个 session 包含多条 records，代表多轮对话历史
@@ -666,10 +742,10 @@ TrajForRL/
 |--------|------|------|
 | Tokenize 位置 | trajectory_construct_cls 负责 | 不绑定特定 tokenizer，更灵活 |
 | 多模态支持 | 首版不支持 | 简化范围，后续扩展 |
-| Step 级奖励 | 预留字段 | 暂不实现，但保留扩展接口 |
+| 奖励字段命名 | 使用 verl 原生命名 | token_level_rewards, token_level_scores，直接与 verl 训练流程对接 |
 | 注册机制 | 函数式注册 | 简单直接，无需继承 |
 | 多 Record 处理 | 可配置 | 通过 processor 控制聚合策略 |
-| Non-Tensor 字段 | 简化为 verl 原生 | 避免过度设计，按需添加 |
+| Non-Tensor 字段 | 支持 uid, ground_truth, data_source | verl 训练流程必需（GRPO advantage 计算需要 uid） |
 | 奖励来源 | 模块内计算 | 由 reward_compute_cls 实现，返回填充后的 Trajectory |
 | 模块封装 | 仅独立模块 | 上层直接调用，不需要 Facade |
 | 调用方式 | 异步调用 (async/await) | 适配上层异步训练框架 |
@@ -783,6 +859,12 @@ def test_converter_basic():
     assert data_proto.batch['input_ids'].shape == (2, 20)
     assert data_proto.batch['prompts'].shape == (2, 10)
     assert data_proto.batch['responses'].shape == (2, 10)
+    # 验证 verl 原生字段命名
+    assert 'token_level_rewards' in data_proto.batch
+    assert 'token_level_scores' in data_proto.batch
+    # 验证 non_tensor_batch
+    assert 'uid' in data_proto.non_tensor_batch
+    assert data_proto.non_tensor_batch['uid'][0] == 'test_1'
 
 def test_converter_truncation():
     """测试截断"""
